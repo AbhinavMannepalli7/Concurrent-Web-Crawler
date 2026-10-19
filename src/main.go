@@ -15,6 +15,7 @@ import (
 )
 
 const MAX_DEPTH = 3
+const MAX_PAGES = 20
 
 func normHost(h string) string {
 	return strings.TrimPrefix(strings.ToLower(h), "www.")
@@ -51,16 +52,16 @@ func main() {
 	root := Node{root_url, nil}
 	q := Queue{1, &root, &root}
 	visited := map[string]*pageData{root_url: {}}
-	depth := 0
 	client := &http.Client{
 		Timeout: 10 * time.Second,
 	}
-	for depth <= MAX_DEPTH {
+	seen := 0
+	for q.size > 0 && seen < MAX_PAGES {
 		lenn := q.size
-		if lenn == 0 {
-			break
-		}
-		for i := 0; i < lenn; i++ {
+		for range lenn {
+			if seen >= MAX_PAGES {
+				break
+			}
 			cur, _ := q.pop()
 
 			req, err := http.NewRequest(http.MethodGet, cur, nil)
@@ -82,6 +83,8 @@ func main() {
 				res.Body.Close()
 				continue
 			}
+
+			seen++
 
 			visited[cur].HTTPStatusCode = res.StatusCode
 
@@ -123,7 +126,6 @@ func main() {
 			visit(doc)
 			fmt.Println(cur, visited[cur])
 		}
-		depth++
 	}
 	fmt.Println("Finished Crawling")
 	return
