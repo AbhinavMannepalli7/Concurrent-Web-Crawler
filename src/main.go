@@ -15,9 +15,11 @@ import (
 	"golang.org/x/net/html"
 )
 
-const MAX_PAGES = 20
-
-var mu sync.Mutex
+const (
+	MAX_PAGES     = 20
+	NUM_CONSUMERS = 4
+	NUM_PRODUCERS = 2
+)
 
 type pageData struct {
 	pageTitle      string
@@ -28,14 +30,29 @@ type pageData struct {
 }
 
 type PageJob struct {
-	URL string
-	Doc *html.Node
+	URL  string
+	Doc  *html.Node
+	Data *pageData
+}
+
+type FetchResult struct {
+	URL  string
+	Doc  *html.Node
+	Data *pageData
+	Err  error
+}
+
+type DiscoveryResult struct {
+	URL   string
+	Links []string
+	Title string
 }
 
 func normHost(h string) string {
 	return strings.TrimPrefix(strings.ToLower(h), "www.")
 }
 
+// standardises url so easier to compare
 func normalize(base *url.URL, href string) (string, error) {
 	u, err := url.Parse(href)
 	if err != nil {
@@ -56,191 +73,187 @@ func normalize(base *url.URL, href string) (string, error) {
 	return u.String(), nil
 }
 
-func processPage(cur string, client *http.Client, visited map[string]*pageData) (*html.Node, error) {
+func processPage(cur string, client *http.Client, data *pageData) (*html.Node, error) {
 	req, err := http.NewRequest(http.MethodGet, cur, nil)
 	if err != nil {
 		return nil, err
 	}
 
-	// Some websites rate limit generic User Agents.
-	req.Header.Set("User-Agent", "MyLearningCrawler/0.1 (you@example.com)")
+	// required as some pages don't accept generic user agents
+	req.Header.Set("User-Agent", "concCrawler/0.1 (you@example.com)")
 
 	start := time.Now()
 	res, err := client.Do(req)
-	visited[cur].Latency = int(time.Since(start))
+	data.Latency = int(time.Since(start))
 
 	if err != nil {
-		// Timed out or failed; skip this URL.
 		return nil, err
 	}
+	defer res.Body.Close()
+
+	data.HTTPStatusCode = res.StatusCode
 
 	if res.StatusCode > 299 {
-		res.Body.Close()
-		return nil, err
+		return nil, fmt.Errorf("HTTP status %d", res.StatusCode)
 	}
-
-	visited[cur].HTTPStatusCode = res.StatusCode
 
 	body, err := io.ReadAll(res.Body)
-	res.Body.Close()
-
 	if err != nil {
 		return nil, err
 	}
 
-	visited[cur].ResponseSize = len(body)
+	data.ResponseSize = len(body)
 
-	doc, err := html.Parse(bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-
-	return doc, nil
+	return html.Parse(bytes.NewReader(body))
 }
 
-func visit(
-	n *html.Node, cur string, visited map[string]*pageData, q *Queue) {
-	base, _ := url.Parse(cur)
+// Consumers take URLs, fetch pages, and send results to the coordinator
+func consumer(client *http.Client, urlQueue <-chan string, results chan<- FetchResult) {
+	for cur := range urlQueue {
+		data := &pageData{}
+		doc, err := processPage(cur, client, data)
 
-	// get page title
-	if n.Type == html.ElementNode && n.Data == "title" && n.FirstChild != nil {
-		visited[cur].pageTitle = n.FirstChild.Data
+		results <- FetchResult{cur, doc, data, err}
 	}
+}
 
-	// discover and enqueue links.
-	if n.Type == html.ElementNode && n.Data == "a" {
-		for _, attr := range n.Attr {
-			if attr.Key != "href" {
-				continue
-			}
+// Producers take parsed documents and extract links
+// They report links to the coordinator rather than modifying visited
+func producer(docQueue <-chan PageJob, discovered chan<- DiscoveryResult) {
+	for page := range docQueue {
+		result := DiscoveryResult{URL: page.URL}
 
-			link, err := normalize(base, attr.Val)
-			if err != nil {
-				continue
-			}
-
-			mu.Lock()
-			if _, seen := visited[link]; !seen {
-				q.push(link)
-				visited[cur].outgoingLinks++
-				visited[link] = &pageData{}
-			}
-			mu.Unlock()
+		base, err := url.Parse(page.URL)
+		if err != nil || page.Doc == nil {
+			discovered <- result
+			continue
 		}
-	}
 
-	// Recursively visit child nodes.
-	for c := n.FirstChild; c != nil; c = c.NextSibling {
-		visit(c, cur, visited, q)
+		var walk func(*html.Node)
+		walk = func(n *html.Node) {
+			if n.Type == html.ElementNode && n.Data == "title" && n.FirstChild != nil {
+				result.Title = n.FirstChild.Data
+			}
+
+			if n.Type == html.ElementNode && n.Data == "a" {
+				for _, attr := range n.Attr {
+					if attr.Key != "href" {
+						continue
+					}
+
+					link, err := normalize(base, attr.Val)
+					if err == nil {
+						result.Links = append(result.Links, link)
+					}
+				}
+			}
+
+			for c := n.FirstChild; c != nil; c = c.NextSibling {
+				walk(c)
+			}
+		}
+
+		walk(page.Doc)
+		discovered <- result
 	}
 }
 
 func crawl(rootURL string, client *http.Client) {
-	root := Node{rootURL, nil}
-	q := Queue{1, &root, &root}
+	// Buffers are bounded by the maximum number of pages
+	urlQueue := make(chan string, MAX_PAGES)
+	docQueue := make(chan PageJob, MAX_PAGES)
+	results := make(chan FetchResult, MAX_PAGES)
+	discovered := make(chan DiscoveryResult, MAX_PAGES)
+
+	var consumerWG sync.WaitGroup
+	var producerWG sync.WaitGroup
+
+	for range NUM_CONSUMERS {
+		consumerWG.Add(1)
+		go func() {
+			defer consumerWG.Done()
+			consumer(client, urlQueue, results)
+		}()
+	}
+
+	for range NUM_PRODUCERS {
+		producerWG.Add(1)
+		go func() {
+			defer producerWG.Done()
+			producer(docQueue, discovered)
+		}()
+	}
+
+	// Only crawl() modifies the visited map and pending counter
 	visited := map[string]*pageData{rootURL: {}}
 
-	seen := 0
+	seen := 1
+	pending := 1
+	urlQueue <- rootURL
 
-	for q.size > 0 && seen < MAX_PAGES {
-		cur, _ := q.pop()
-
-		doc, err := processPage(cur, client, visited)
-		if err != nil {
-			// Do something.
-		}
-
-		seen++
-
-		go visit(doc, cur, visited, &q)
-
-		fmt.Println(cur, visited[cur])
-	}
-
-	fmt.Println("Finished Crawling")
-}
-
-func producer(urlQueue chan string, docQueue chan PageJob) {
-	page := <-docQueue
-	cur := page.URL
-	n := page.Doc
-
-	base, _ := url.Parse(cur)
-
-	/*
-		// get page title
-		if n.Type == html.ElementNode && n.Data == "title" && n.FirstChild != nil {
-			visited[cur].pageTitle = n.FirstChild.Data
-		}
-
-	*/
-
-	// discover and enqueue links.
-	if n.Type == html.ElementNode && n.Data == "a" {
-		for _, attr := range n.Attr {
-			if attr.Key != "href" {
+	for pending > 0 {
+		select {
+		case result := <-results:
+			if result.Err != nil {
+				fmt.Printf("Failed: %s: %v\n", result.URL, result.Err)
+				pending--
 				continue
 			}
 
-			link, err := normalize(base, attr.Val)
-			if err != nil {
-				continue
-			}
+			// Keep this page outstanding until link discovery finishes
+			docQueue <- PageJob{result.URL, result.Doc, result.Data}
 
-			urlQueue <- link
+			visited[result.URL] = result.Data
 
-			/*
-				mu.Lock()
-				if _, seen := visited[link]; !seen {
-					q.push(link)
-					visited[cur].outgoingLinks++
-					visited[link] = &pageData{}
+		case result := <-discovered:
+			data := visited[result.URL]
+			data.pageTitle = result.Title
+
+			for _, link := range result.Links {
+				if _, exists := visited[link]; exists {
+					continue
 				}
-				mu.Unlock()
-			*/
+
+				if seen >= MAX_PAGES {
+					break
+				}
+
+				// Register new work before completing the current page
+				visited[link] = &pageData{}
+				seen++
+				pending++
+				data.outgoingLinks++
+
+				urlQueue <- link
+			}
+
+			// This page has finished link discovery
+			pending--
 		}
 	}
-}
 
-func consumer(client *http.Client) {
-	cur := <-urlQueue
+	// All pages have finished, including link discovery
+	close(urlQueue)
+	consumerWG.Wait()
 
-	req, _ := http.NewRequest(http.MethodGet, cur, nil)
+	close(docQueue)
+	producerWG.Wait()
 
-	// Some websites rate limit generic User Agents.
-	req.Header.Set("User-Agent", "MyLearningCrawler/0.1 (you@example.com)")
-
-	//start := time.Now()
-	res, _ := client.Do(req)
-	//visited[cur].Latency = int(time.Since(start))
-
-	if res.StatusCode > 299 {
-		res.Body.Close()
-
+	fmt.Println("\nCrawl results:")
+	for link, data := range visited {
+		fmt.Printf("%s | title=%q status=%d links=%d size=%d latency=%s\n", link, data.pageTitle, data.HTTPStatusCode, data.outgoingLinks, data.ResponseSize, time.Duration(data.Latency))
 	}
 
-	//visited[cur].HTTPStatusCode = res.StatusCode
-
-	body, _ := io.ReadAll(res.Body)
-	res.Body.Close()
-
-	//visited[cur].ResponseSize = len(body)
-
-	doc, _ := html.Parse(bytes.NewReader(body))
-
-	docQueue <- PageJob{cur, doc}
+	fmt.Printf("\nFinished crawling: %d pages scheduled\n", seen)
 }
 
 func main() {
-	rootURL := os.Args[1]
-
-	client := &http.Client{
-		Timeout: 10 * time.Second,
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "Usage: crawler <root-url>")
+		os.Exit(1)
 	}
 
-	urlQueue := make(chan string, 100)
-	docQueue := make(chan PageJob, 100)
+	client := &http.Client{Timeout: 10 * time.Second}
 
-	urlQueue <- rootURL
-
+	crawl(os.Args[1], client)
 }
